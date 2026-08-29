@@ -4,21 +4,21 @@ RepoXray is a zero-dependency CLI tool that scans, searches, explores, and inspe
 
 ## Features
 - **Zero Dependencies**: Built entirely using the Python 3 standard library.
-- **Scan & Overview**: Build a persistent project map, identify files, detect entry points, orphans and cyclic dependencies.
+- **Scan & Overview**: Build a persistent project map, identify files, detect heuristic entry points, orphans, and cyclic dependencies.
 - **Dependency Graph**: Path-aware resolution for Python and JS/TS imports. Tracks forward and reverse relationships, categorizing them as proven, heuristic, ambiguous, or unresolved.
-  - *Python imports are parsed using compiler-grade ASTs.*
+  - *Python imports use standard-library AST extraction, though resolution to filesystem paths remains heuristic.*
 - **Impact Tracing**: Cycle-safe traversal to separate direct vs. indirect (transitive) dependents.
-- **Binary Inspector**: X-ray unknown files using magic bytes, extracting safe metadata (like SQLite schemas, ZIP contents) and warning on extension mismatches or file corruption (full structural validation for ZIPs and JSON).
-- **Indexed Search**: O(1) line-level inverted index lookup for blazing-fast precise searches.
-- **JSON Export**: Every command supports `--output <file>` or `--output -` for clean integration into other tools.
+- **Binary Inspector**: X-ray unknown files using magic bytes, extracting metadata, and warning on extension mismatches (with structural CRC validation for ZIPs and JSON, and header inspection for SQLite).
+- **Indexed Search**: Per-file line postings cache for fast, precise line-level searches.
+- **JSON Export**: Every command supports `--output <file>` or `--output -`.
 
 ## Commands
-- `scan [path] [--output FILE|-]`: Builds or incrementally updates `.repoxray.json`. It is O(changed-files) fast via an mtime+size fast-path and tracks rename operations natively.
+- `scan [path] [--output FILE|-]`: Builds or updates `.repoxray.json`. Employs mtime/size fast-paths and practical rename reporting (note: still performs an O(N) filesystem walk).
 - `overview [path] [--output FILE|-]`: Shows project health, counts, warnings, and a directory tree map.
-- `depends-on <file> [path] [--output FILE|-]`: Shows what the given file imports (forward dependencies).
-- `who-uses <file> [path] [--output FILE|-]`: Shows what imports the given file (reverse dependencies).
-- `impact <file> [path] [--output FILE|-]`: Estimates potential direct and indirect impact if the file changes.
-- `search <query> [path] [--path <glob>] [--output FILE|-]`: Fast content and/or path search.
+- `depends-on <file> [path] [--output FILE|-]`: Shows what the given file imports.
+- `who-uses <file> [path] [--output FILE|-]`: Shows what imports the given file.
+- `impact <file> [path] [--output FILE|-]`: Estimates potential direct and indirect impact.
+- `search <query> [path] [--path <glob>] [--output FILE|-]`: Fast content/path search using index prefilters.
 - `inspect <file> [--output FILE|-]`: Deep inspection of a single file.
 
 ## Output Schemas
