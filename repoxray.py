@@ -8,84 +8,80 @@ import hashlib
 import fnmatch
 import struct
 import zipfile
+import ast
 from collections import defaultdict, deque
 
-SCHEMA_VERSION = "2.2"
+SCHEMA_VERSION = "3.0"
 INDEX_FILE = '.repoxray.json'
 DEFAULT_IGNORE = {'.git', 'node_modules', '__pycache__', 'venv', 'env', 'dist', 'build', '.next'}
 
 IMPORT_PATTERNS = {
-    'python': [
-        re.compile(r'^\s*import\s+(.+)', re.MULTILINE),
-        re.compile(r'^\s*from\s+([\.a-zA-Z0-9_]+)\s+import\s+(?:\(([^)]+)\)|([^\n]+))', re.MULTILINE)
-    ],
     'js': [
         re.compile(r'import\s+.*?from\s+[\'"]([^\'"]+)[\'"]', re.MULTILINE),
         re.compile(r'require\([\'"]([^\'"]+)[\'"]\)', re.MULTILINE)
     ]
 }
 
-def disable_colors():
-    pass
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+def disable_colors(): pass
+def eprint(*args, **kwargs): print(*args, file=sys.stderr, **kwargs)
 
 def get_file_hash(filepath):
     hasher = hashlib.sha256()
     try:
         with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
-                hasher.update(chunk)
+            for chunk in iter(lambda: f.read(65536), b''): hasher.update(chunk)
         return hasher.hexdigest()
-    except Exception:
-        return None
+    except Exception: return None
 
 def is_text_file(filepath):
     try:
         with open(filepath, 'tr', encoding='utf-8') as f:
             f.read(1024)
             return True
-    except Exception:
-        return False
-
-def clean_python_import(imp_str):
-    return re.sub(r'\s+as\s+\w+', '', imp_str).strip()
+    except Exception: return False
 
 def parse_text_file(filepath, file_type):
-    deps, words, warnings = set(), set(), []
+    deps, words_index, warnings = set(), defaultdict(list), []
+    is_entry_point = False
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
-            overlap = ""
-            while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk: break
-                text = overlap + chunk
-                
-                if file_type == 'python':
-                    # Preprocess text to remove backslash newlines for regex to work easily
-                    clean_text = text.replace('\\\n', ' ')
-                    for match in IMPORT_PATTERNS['python'][0].findall(clean_text):
-                        for m in match.split(','): deps.add(clean_python_import(m))
-                    for match in IMPORT_PATTERNS['python'][1].findall(clean_text):
-                        mod = match[0]
-                        syms = match[1] if match[1] else match[2]
-                        deps.add(mod)
-                        for sym in syms.split(','):
-                            sym = clean_python_import(sym)
-                            if not sym: continue
-                            if mod.endswith('.'): deps.add(mod + sym)
-                            else: deps.add(mod + '.' + sym)
-                else:
-                    for pattern in IMPORT_PATTERNS.get(file_type, []):
-                        for match in pattern.findall(text):
-                            for m in match.split(','): deps.add(m.strip())
-                for w in re.findall(r'[a-zA-Z0-9_]{3,}', text.lower()):
-                    words.add(w)
-                overlap = text[-500:] if len(text) > 500 else text
+            text = f.read()
+            
+        # Line-location inverted index
+        lines = text.split('\n')
+        for line_num, line in enumerate(lines, 1):
+            for w in re.findall(r'[a-zA-Z0-9_]{3,}', line.lower()):
+                if not words_index[w] or words_index[w][-1] != line_num:
+                    words_index[w].append(line_num)
+        
+        # AST parsing for Python
+        if file_type == 'python':
+            if "if __name__ == '__main__':" in text or 'if __name__ == "__main__":' in text:
+                is_entry_point = True
+            try:
+                tree = ast.parse(text)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for n in node.names: deps.add(n.name)
+                    elif isinstance(node, ast.ImportFrom):
+                        mod = node.module or ''
+                        prefix = '.' * node.level if node.level > 0 else ''
+                        full_mod = prefix + mod
+                        deps.add(full_mod)
+                        for n in node.names:
+                            if full_mod.endswith('.'): deps.add(full_mod + n.name)
+                            else: deps.add(full_mod + '.' + n.name)
+            except SyntaxError as e:
+                warnings.append(f"Python AST SyntaxError: {e}")
+        else:
+            if os.path.basename(filepath) in ['index.js', 'server.js', 'main.js']:
+                is_entry_point = True
+            for pattern in IMPORT_PATTERNS.get(file_type, []):
+                for match in pattern.findall(text):
+                    for m in match.split(','): deps.add(m.strip())
     except Exception as e:
-        warnings.append(f"Partial scan or read error: {e}")
-    return list(deps), list(words), warnings
+        warnings.append(f"Scan error: {e}")
+    return list(deps), dict(words_index), is_entry_point, warnings
 
 def resolve_dependency(source_file, raw_dep, all_files):
     dir_name = os.path.dirname(source_file)
@@ -128,7 +124,6 @@ def resolve_dependency(source_file, raw_dep, all_files):
 
 def scan(directory, output_file=None):
     old_index = load_index(directory, silent=True) or {'files': {}}
-    
     index = {
         'version': SCHEMA_VERSION,
         'metadata': {'total_files': 0, 'total_dirs': 0, 'total_size': 0, 'warnings': []},
@@ -142,10 +137,8 @@ def scan(directory, output_file=None):
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in DEFAULT_IGNORE]
         index['metadata']['total_dirs'] += 1
-        
         for file in files:
             if file == INDEX_FILE: continue
-                
             filepath = os.path.join(root, file)
             rel_path = os.path.normpath(os.path.relpath(filepath, directory))
             all_current_paths.add(rel_path)
@@ -156,9 +149,14 @@ def scan(directory, output_file=None):
                 index['metadata']['total_size'] += size
                 index['metadata']['total_files'] += 1
                 
-                current_hash = get_file_hash(filepath)
                 old_record = old_index['files'].get(rel_path)
+                # Fast path O(changed-files) using mtime/size
+                if old_record and old_record.get('mtime') == mtime and old_record.get('size') == size:
+                    index['files'][rel_path] = old_record
+                    unchanged.append(rel_path)
+                    continue
                 
+                current_hash = get_file_hash(filepath)
                 if old_record and old_record.get('hash') == current_hash:
                     old_record['mtime'] = mtime
                     index['files'][rel_path] = old_record
@@ -172,7 +170,7 @@ def scan(directory, output_file=None):
                 f_type = 'python' if ext == '.py' else ('js' if ext in ['.js','.jsx','.ts','.tsx'] else 'unknown')
                 is_text = is_text_file(filepath)
                 
-                deps, words, f_warns = parse_text_file(filepath, f_type) if is_text else ([], [], [])
+                deps, words_index, is_entry_point, f_warns = parse_text_file(filepath, f_type) if is_text else ([], {}, False, [])
                 if f_warns: skipped_count += 1
                 index['metadata']['warnings'].extend([f"{rel_path}: {w}" for w in f_warns])
                 
@@ -192,7 +190,8 @@ def scan(directory, output_file=None):
                     'heuristic_deps': [],
                     'ambiguous_deps': [],
                     'unresolved_deps': [],
-                    'words': words,
+                    'words_index': words_index,
+                    'is_entry_point': is_entry_point,
                     'category': cat,
                     'ambiguous_candidates': {}
                 }
@@ -202,11 +201,23 @@ def scan(directory, output_file=None):
 
     old_paths = set(old_index['files'].keys())
     deleted = list(old_paths - all_current_paths)
+    
+    # Rename detection
+    deleted_hashes = {p: old_index['files'][p]['hash'] for p in deleted}
+    added_hashes = {p: index['files'][p]['hash'] for p in added}
+    renames = []
+    for a_path, a_hash in added_hashes.items():
+        for d_path, d_hash in list(deleted_hashes.items()):
+            if a_hash == d_hash:
+                renames.append({'from': d_path, 'to': a_path})
+                added.remove(a_path)
+                deleted.remove(d_path)
+                del deleted_hashes[d_path]
+                break
 
     all_files = set(index['files'].keys())
     for rel_path, info in index['files'].items():
-        if info.get('resolved_deps') and rel_path in unchanged: continue # Skip dep resolution for unchanged
-        
+        if info.get('resolved_deps') and rel_path in unchanged: continue
         resolved, heuristic, ambiguous, unresolved = [], [], [], []
         ambig_cand = {}
         for raw_dep in info.get('raw_dependencies', []):
@@ -233,13 +244,14 @@ def scan(directory, output_file=None):
         "added": sorted(added),
         "changed": sorted(changed),
         "deleted": sorted(deleted),
+        "renames": renames,
         "unchanged": sorted(unchanged),
         "reused_count": len(unchanged),
         "warnings": index['metadata']['warnings']
     }
 
     if output_file: output_result(summary, output_file)
-    else: print(f"Scan complete. Reused: {len(unchanged)}, Added: {len(added)}, Changed: {len(changed)}, Deleted: {len(deleted)}")
+    else: print(f"Scan complete. Reused: {len(unchanged)}, Added: {len(added)}, Changed: {len(changed)}, Deleted: {len(deleted)}, Renamed: {len(renames)}")
 
 def load_index(directory, silent=False):
     index_path = os.path.join(directory, INDEX_FILE)
@@ -309,8 +321,7 @@ def generate_tree(files):
     return "\n".join(lines)
 
 def output_result(data, output_file):
-    if output_file == '-':
-        print(json.dumps(data, indent=2))
+    if output_file == '-': print(json.dumps(data, indent=2))
     else:
         with open(output_file, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2)
         print(f"Report saved to {output_file}")
@@ -320,7 +331,7 @@ def overview(directory, output_file=None):
     if not index: sys.exit(1)
         
     forward, reverse = build_forward_reverse(index)
-    orphans = [p for p, info in index['files'].items() if p not in reverse and info['category'] == 'source']
+    orphans = [p for p, info in index['files'].items() if p not in reverse and info['category'] == 'source' and not info.get('is_entry_point')]
     cycles = find_cycles(forward)
     
     categories = defaultdict(int)
@@ -440,25 +451,29 @@ def search(query, directory, path_glob=None, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
     matches_found = []
-    # Case sensitive search in content, case insensitive prefilter
-    query_words = set(re.findall(r'[a-zA-Z0-9_]{3,}', query.lower()))
+    q_lower = query.lower()
+    
     for filepath, info in index['files'].items():
         if path_glob and not fnmatch.fnmatch(filepath, path_glob): continue
         if not info.get('is_text'): continue
-        if query_words and not query_words.issubset(set(info.get('words', []))): continue
-            
+        
+        words_index = info.get('words_index', {})
+        if q_lower not in words_index: continue
+        
         full_path = os.path.join(directory, filepath)
         try:
             with open(full_path, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    if query in line:
-                        matches_found.append({'file': filepath, 'line': line_num, 'context': line.strip()[:100]})
+                lines = f.readlines()
+                for line_num in words_index[q_lower]:
+                    line_idx = line_num - 1
+                    if line_idx < len(lines) and query in lines[line_idx]:
+                        matches_found.append({'file': filepath, 'line': line_num, 'context': lines[line_idx].strip()[:100]})
         except Exception: pass
                 
     matches_found.sort(key=lambda x: (x['file'], x['line']))
     if output_file: output_result({"matches": matches_found, "count": len(matches_found)}, output_file)
     else:
-        print(f"Searching for '{query}' (Indexed)...")
+        print(f"Searching for '{query}' (Full Inverted Index)...")
         for m in matches_found: print(f"{m['file']}:{m['line']} {m['context']}")
         print(f"Total matches: {len(matches_found)}")
 
@@ -491,17 +506,24 @@ def inspect(filepath, output_file=None):
         file_type, confidence = "PDF Document", "High (Signature)"
         if ext != '.pdf': is_mismatch = True
     elif header.startswith(b'PK\x03\x04'): 
-        file_type, confidence = "ZIP Archive", "High (Signature)"
+        file_type, confidence = "ZIP Archive", "High (Validated)"
         try:
-            with zipfile.ZipFile(filepath, 'r') as z: metadata['zip_members'] = z.namelist()[:10]
-        except Exception as e: warnings.append(f"Malformed ZIP: {str(e)}")
+            with zipfile.ZipFile(filepath, 'r') as z:
+                metadata['zip_members'] = z.namelist()[:10]
+                bad_file = z.testzip()
+                if bad_file: warnings.append(f"Corrupted file inside ZIP: {bad_file}")
+        except Exception as e:
+            confidence = "Low (Malformed)"
+            warnings.append(f"Malformed ZIP: {str(e)}")
     elif header.startswith(b'SQLite format 3\x00'): 
-        file_type, confidence = "SQLite Database", "High (Signature)"
+        file_type, confidence = "SQLite Database", "High (Validated)"
         try:
             with open(filepath, 'rb') as f:
-                f.seek(16)
-                metadata['page_size'] = struct.unpack(">H", f.read(2))[0]
-        except Exception as e: warnings.append(f"Malformed SQLite: {str(e)}")
+                f.seek(16); metadata['page_size'] = struct.unpack(">H", f.read(2))[0]
+                f.seek(28); metadata['size_in_pages'] = struct.unpack(">I", f.read(4))[0]
+        except Exception as e:
+            confidence = "Low (Malformed)"
+            warnings.append(f"Malformed SQLite: {str(e)}")
     elif is_text_file(filepath): 
         file_type, confidence, is_text = "Text/Source", "Medium (Heuristic)", True
         if ext not in ['.txt', '.md', '.py', '.js', '.ts', '.html', '.css', '.json', '.yaml', '.yml', '.toml', '.ini', '.csv', '.xml', '']:
@@ -510,8 +532,11 @@ def inspect(filepath, output_file=None):
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                    confidence = "High (Validated JSON)"
                     if isinstance(data, dict): metadata['json_keys'] = list(data.keys())[:10]
-            except Exception as e: warnings.append(f"Malformed JSON: {str(e)}")
+            except Exception as e:
+                confidence = "Low (Malformed JSON)"
+                warnings.append(f"Malformed JSON: {str(e)}")
 
     result = {
         "path": filepath,
@@ -531,8 +556,7 @@ def inspect(filepath, output_file=None):
         result["first_bytes_ascii"] = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in header)
 
     if output_file: output_result(result, output_file)
-    else:
-        print(json.dumps(result, indent=2))
+    else: print(json.dumps(result, indent=2))
 
 def main():
     parser = argparse.ArgumentParser(description="RepoXray - Zero Dependency Codebase Analyzer")
