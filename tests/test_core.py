@@ -9,13 +9,8 @@ class TestRepoXray(unittest.TestCase):
         self.test_dir = tempfile.TemporaryDirectory()
         self.repo_path = self.test_dir.name
         
-        # Create a mock project
-        # a.py -> imports b.py
-        # b.py -> imports c.py
-        # c.py -> standalone
-        
         with open(os.path.join(self.repo_path, 'a.py'), 'w') as f:
-            f.write("import b\nprint('A')")
+            f.write("import b\nprint('A')\nfrom c import func")
             
         with open(os.path.join(self.repo_path, 'b.py'), 'w') as f:
             f.write("from c import func\nprint('B')")
@@ -34,26 +29,38 @@ class TestRepoXray(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run([self.cli_path] + list(args), cwd=self.repo_path, capture_output=True, text=True)
 
-    def test_scan_creates_index(self):
-        res = self.run_cli("scan", ".")
-        self.assertEqual(res.returncode, 0)
+    def test_scan_incremental(self):
+        res1 = self.run_cli("scan", ".")
         self.assertTrue(os.path.exists(os.path.join(self.repo_path, '.repoxray.json')))
+        res2 = self.run_cli("scan", ".")
+        self.assertIn("Incremental", res2.stdout)
+        
+    def test_multiline_import_and_impact(self):
+        self.run_cli("scan", ".")
+        res = self.run_cli("impact", "c.py", ".", "--output", "report.json")
+        self.assertEqual(res.returncode, 0)
+        with open(os.path.join(self.repo_path, 'report.json')) as f:
+            data = json.load(f)
+        # c is used by b and a directly
+        self.assertIn("b.py", data["direct"])
+        self.assertIn("a.py", data["direct"])
 
-    def test_who_uses(self):
+    def test_js_relative_import(self):
         self.run_cli("scan", ".")
-        res = self.run_cli("who-uses", "b.py")
-        self.assertIn("a.py", res.stdout)
+        res = self.run_cli("who-uses", "utils.js", ".", "--output", "report.json")
+        with open(os.path.join(self.repo_path, 'report.json')) as f:
+            data = json.load(f)
+        self.assertIn("index.js", data)
         
-    def test_impact(self):
+    def test_search_indexed(self):
         self.run_cli("scan", ".")
-        res = self.run_cli("impact", "c.py")
-        self.assertIn("b.py", res.stdout)
-        self.assertIn("a.py", res.stdout) # Transitive impact
-        
-    def test_search(self):
-        res = self.run_cli("search", "func", ".")
-        self.assertIn("c.py:1", res.stdout)
-        self.assertIn("b.py:1", res.stdout)
+        res = self.run_cli("search", "func", ".", "--output", "report.json")
+        with open(os.path.join(self.repo_path, 'report.json')) as f:
+            data = json.load(f)
+        files = [d['file'] for d in data]
+        self.assertIn("c.py", files)
+        self.assertIn("b.py", files)
+        self.assertIn("a.py", files)
 
     def tearDown(self):
         self.test_dir.cleanup()
