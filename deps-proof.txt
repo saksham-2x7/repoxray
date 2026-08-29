@@ -1,2 +1,12 @@
-Run this command in a clean Python 3 environment to verify zero external dependencies:
+Zero-dependency verification for RepoXray:
+
 $ python3 -S -c "import repoxray; print('stdlib import check passed')"
+stdlib import check passed
+
+The -S flag disables site-packages. RepoXray imports only Python standard-library modules at runtime.
+
+Complete test suite:
+
+$ python3 -m unittest discover -v
+
+The repository must be tested from its root so the test runner discovers tests/test_core.py.

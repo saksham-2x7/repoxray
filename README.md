@@ -12,6 +12,20 @@ RepoXray is a zero-dependency CLI tool that scans, searches, explores, and inspe
 - **Indexed Search**: Per-file line postings cache for fast, precise line-level searches.
 - **JSON Export**: Every command supports `--output <file>` or `--output -`.
 
+## Quick Start
+
+```bash
+python3 repoxray.py scan .
+python3 repoxray.py overview .
+python3 repoxray.py search "query" .
+python3 repoxray.py inspect repoxray.py
+python3 repoxray.py who-uses repoxray.py .
+python3 repoxray.py depends-on repoxray.py .
+python3 repoxray.py impact repoxray.py .
+```
+
+The commands operate on the persistent `.repoxray.json` index created by `scan`. Run `scan` again after adding, changing, or deleting files.
+
 ## Commands
 - `scan [path] [--output FILE|-]`: Builds or updates `.repoxray.json`. Employs mtime/size fast-paths and practical rename reporting (note: still performs an O(N) filesystem walk).
 - `overview [path] [--output FILE|-]`: Shows project health, counts, warnings, and a directory tree map.
@@ -31,7 +45,7 @@ RepoXray is a zero-dependency CLI tool that scans, searches, explores, and inspe
 ```
 
 ## Verification
-Run `python3 -S -c "import repoxray; print('stdlib check passed')"` to verify zero dependencies.
+Run `python3 -m unittest discover -v` for the complete test suite. Run `python3 -S -c "import repoxray; print('stdlib check passed')"` to verify that runtime imports use only the Python standard library.
 
 ## Contributors
 - [HamzaShaikh-source](https://github.com/HamzaShaikh-source)

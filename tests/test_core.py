@@ -1,9 +1,10 @@
 import unittest
 import os
+import sys
+import repoxray
 import json
 import tempfile
 import subprocess
-import shutil
 import time
 
 class TestRepoXray(unittest.TestCase):
@@ -65,13 +66,17 @@ class TestRepoXray(unittest.TestCase):
         self.cli_path = os.path.abspath("repoxray.py")
 
     def run_cli(self, *args):
-        return subprocess.run([self.cli_path] + list(args), cwd=self.repo_path, capture_output=True, text=True)
+        # Use sys.executable so the correct Python interpreter is invoked on all
+        # platforms.  On Windows, .py files cannot be executed directly as
+        # Win32 applications (shebang lines are ignored), so passing the script
+        # path alone to subprocess raises OSError [WinError 193].
+        return subprocess.run([sys.executable, self.cli_path] + list(args), cwd=self.repo_path, capture_output=True, text=True)
 
     def test_empty_project(self):
         with tempfile.TemporaryDirectory() as empty_dir:
-            res = subprocess.run([self.cli_path, "scan", "."], cwd=empty_dir, capture_output=True, text=True)
+            res = subprocess.run([sys.executable, self.cli_path, "scan", "."], cwd=empty_dir, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0)
-            res2 = subprocess.run([self.cli_path, "overview", ".", "--output", "-"], cwd=empty_dir, capture_output=True, text=True)
+            res2 = subprocess.run([sys.executable, self.cli_path, "overview", ".", "--output", "-"], cwd=empty_dir, capture_output=True, text=True)
             self.assertEqual(json.loads(res2.stdout)["total_files"], 0)
 
     def test_empty_file(self):
@@ -164,57 +169,81 @@ class TestRepoXray(unittest.TestCase):
         self.assertIn("Error reading index", res.stderr)
 
     def test_zero_dependency_import(self):
-        # A clean environment import check
-        res = subprocess.run(["python3", "-c", "import repoxray; print('ok')"], cwd=os.path.dirname(self.cli_path), capture_output=True, text=True)
+        # Verify the module imports cleanly.  sys.executable is used instead of
+        # a hardcoded "python3" so the test runs on Windows and in virtual envs.
+        res = subprocess.run([sys.executable, "-c", "import repoxray; print('ok')"], cwd=os.path.dirname(self.cli_path), capture_output=True, text=True)
         self.assertIn("ok", res.stdout)
 
     def tearDown(self):
         self.test_dir.cleanup()
 
+    def test_category_boundary(self):
+        self.run_cli("scan", ".")
+        with open(os.path.join(self.repo_path, '.repoxray.json')) as f:
+            data = json.load(f)
+        self.assertEqual(data["files"]["bad.json"]["category"], "config")
+
+    def test_incremental_dependency_addition_and_deletion(self):
+        dep = os.path.join(self.repo_path, "temp_helper.py")
+        source = os.path.join(self.repo_path, "temp_source.py")
+        with open(source, 'w') as f: f.write("import temp_helper\n")
+        self.run_cli("scan", ".")
+        with open(dep, 'w') as f: f.write("VALUE = 1\n")
+        self.run_cli("scan", ".")
+        with open(os.path.join(self.repo_path, '.repoxray.json')) as f:
+            added = json.load(f)
+        self.assertIn("temp_helper.py", added["files"]["temp_source.py"]["resolved_deps"])
+        os.unlink(dep)
+        self.run_cli("scan", ".")
+        with open(os.path.join(self.repo_path, '.repoxray.json')) as f:
+            deleted = json.load(f)
+        self.assertIn("temp_helper", deleted["files"]["temp_source.py"]["unresolved_deps"])
+
+    def test_malformed_index_structure(self):
+        self.run_cli("scan", ".")
+        with open(os.path.join(self.repo_path, '.repoxray.json'), 'w') as f:
+            json.dump({"version": "3.1", "files": {}}, f)
+        res = self.run_cli("overview", ".")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("Malformed index", res.stderr)
+
+    def test_deep_traversals(self):
+        deep_path = '/'.join(f'd{i}' for i in range(1100)) + '/x.py'
+        self.assertIn('x.py', repoxray.generate_tree([deep_path]))
+        forward = {f'n{i}': [f'n{i+1}'] for i in range(1100)}
+        forward['n1100'] = []
+        self.assertEqual(repoxray.find_cycles(forward), [])
+
+    def test_tree_sorted_order(self):
+        # Verify that generate_tree renders directories and files in ascending
+        # sorted order, matching the behaviour of the original recursive walk.
+        # Input paths chosen so alphabetical ordering is unambiguous.
+        files = [
+            "alpha/a_file.py",
+            "alpha/b_file.py",
+            "beta/sub/deep.py",
+            "beta/top.py",
+            "gamma/only.py",
+            "root.py",
+        ]
+        tree = repoxray.generate_tree(files)
+        lines = tree.splitlines()
+        # Each line from generate_tree contains "── " as a fixed separator.
+        # Split on it to extract just the entry name, stripping all tree-drawing
+        # prefix characters regardless of Unicode encoding.
+        labels = [l.split("\u2500\u2500 ", 1)[-1].rstrip() for l in lines]
+        self.assertEqual(len(labels), 10)
+        self.assertEqual(labels[0], "alpha/")
+        self.assertEqual(labels[1], "a_file.py")
+        self.assertEqual(labels[2], "b_file.py")
+        self.assertEqual(labels[3], "beta/")
+        # beta/sub/ (dir) comes before beta/top.py (file): dirs rendered before files
+        self.assertEqual(labels[4], "sub/")
+        self.assertEqual(labels[5], "deep.py")
+        self.assertEqual(labels[6], "top.py")
+        self.assertEqual(labels[7], "gamma/")
+        self.assertEqual(labels[8], "only.py")
+        self.assertEqual(labels[9], "root.py")
+
 if __name__ == '__main__':
     unittest.main()
-
-    def test_permission_error_handling(self):
-        # Create unreadable file
-        unreadable = os.path.join(self.repo_path, 'unreadable.txt')
-        with open(unreadable, 'w') as f: f.write("secret")
-        os.chmod(unreadable, 0o000)
-        try:
-            self.run_cli("scan", ".")
-            res = self.run_cli("overview", ".", "--output", "-")
-            warnings = json.loads(res.stdout).get("warnings", [])
-            self.assertTrue(any("Could not read" in w for w in warnings))
-        finally:
-            os.chmod(unreadable, 0o644)
-            
-    def test_search_streaming_memory(self):
-        huge_single_line = os.path.join(self.repo_path, 'minified.js')
-        with open(huge_single_line, 'w') as f:
-            f.write("var a=1;" * 100000 + " console.log('target_needle');")
-        self.run_cli("scan", ".")
-        res = self.run_cli("search", "target_needle", "--output", "-")
-        data = json.loads(res.stdout)
-        self.assertEqual(data["count"], 1)
-        self.assertIn("target_needle", data["matches"][0]["context"])
-
-    def test_permission_error_handling(self):
-        unreadable = os.path.join(self.repo_path, 'unreadable.txt')
-        with open(unreadable, 'w') as f: f.write("secret")
-        os.chmod(unreadable, 0o000)
-        try:
-            self.run_cli("scan", ".")
-            res = self.run_cli("overview", ".", "--output", "-")
-            warnings = __import__('json').loads(res.stdout).get("warnings", [])
-            self.assertTrue(any("Permission denied" in w or "Could not read" in w for w in warnings))
-        finally:
-            os.chmod(unreadable, 0o644)
-            
-    def test_search_streaming_memory(self):
-        huge_single_line = os.path.join(self.repo_path, 'minified.js')
-        with open(huge_single_line, 'w') as f:
-            f.write("var a=1;" * 1000 + " console.log('target_needle');")
-        self.run_cli("scan", ".")
-        res = self.run_cli("search", "target_needle", "--output", "-")
-        data = __import__('json').loads(res.stdout)
-        self.assertEqual(data["count"], 1)
-        self.assertIn("target_needle", data["matches"][0]["context"])

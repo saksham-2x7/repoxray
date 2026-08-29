@@ -1,4 +1,7 @@
 [project]
 name = "repoxray"
+track = "A"
+pitch = "A zero-dependency CLI that scans, understands, searches, inspects, and traces software repositories."
 dependencies = []
 standard_library_only = true
+zero_runtime_dependencies = true

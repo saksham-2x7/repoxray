@@ -6,7 +6,6 @@ import json
 import re
 import hashlib
 import fnmatch
-import struct
 import zipfile
 import ast
 import sqlite3
@@ -25,7 +24,6 @@ IMPORT_PATTERNS = {
     ]
 }
 
-def disable_colors(): pass
 def eprint(*args, **kwargs): print(*args, file=sys.stderr, **kwargs)
 
 def get_file_hash(filepath):
@@ -109,18 +107,18 @@ def resolve_dependency(source_file, raw_dep, all_files):
         mod_path = raw_dep.lstrip('.').replace('.', '/')
         target_dir = dir_name
         for _ in range(dots - 1): target_dir = os.path.dirname(target_dir)
-        target = os.path.normpath(os.path.join(target_dir, mod_path)) if mod_path else target_dir
+        target = os.path.normpath(os.path.join(target_dir, mod_path)).replace('\\', '/') if mod_path else target_dir.replace('\\', '/')
         for ext in exts_py:
             if target + ext in all_files: return target + ext, "resolved_relative", []
                 
     elif raw_dep.startswith('.'):
-        target = os.path.normpath(os.path.join(dir_name, raw_dep))
+        target = os.path.normpath(os.path.join(dir_name, raw_dep)).replace('\\', '/')
         for ext in (exts_js if is_js else exts_py):
             if target + ext in all_files: return target + ext, "resolved_relative", []
     else:
         py_target = raw_dep.replace('.', '/')
         for ext in (exts_js if is_js else exts_py):
-            local_target = os.path.normpath(os.path.join(dir_name, py_target)) + ext
+            local_target = os.path.normpath(os.path.join(dir_name, py_target)).replace('\\', '/') + ext
             if local_target in all_files: return local_target, "resolved_local", []
             if py_target + ext in all_files: return py_target + ext, "resolved_root", []
             
@@ -147,7 +145,6 @@ def scan(directory, force_hash=False, output_file=None):
     
     all_current_paths = set()
     added, changed, unchanged = [], [], []
-    skipped_count = 0
     
     def walk_err(err):
         index['metadata']['warnings'].append(f"Directory access denied: {err}")
@@ -189,11 +186,11 @@ def scan(directory, force_hash=False, output_file=None):
                 is_text = is_text_file(filepath)
                 
                 deps, words_index, is_entry_point, f_warns = parse_text_file(filepath, f_type) if is_text else ([], {}, False, [])
-                if f_warns: skipped_count += 1
                 index['metadata']['warnings'].extend([f"{rel_path}: {w}" for w in f_warns])
                 
                 cat = 'source' if f_type != 'unknown' else 'other'
-                if 'test' in file.lower() or 'spec' in file.lower(): cat = 'test'
+                name_tokens = set(re.findall(r'[a-zA-Z0-9]+', file.lower()))
+                if {'test', 'spec'} & name_tokens: cat = 'test'
                 elif ext in ['.json', '.yaml', '.yml', '.toml', '.env', '.ini']: cat = 'config'
                     
                 index['files'][rel_path] = {
@@ -215,10 +212,8 @@ def scan(directory, force_hash=False, output_file=None):
                 }
             except PermissionError:
                 index['metadata']['warnings'].append(f"Permission denied: {rel_path}")
-                skipped_count += 1
             except Exception as e:
                 index['metadata']['warnings'].append(f"Could not read {rel_path}: {str(e)}")
-                skipped_count += 1
 
     old_paths = set(old_index['files'].keys())
     deleted = list(old_paths - all_current_paths)
@@ -273,6 +268,16 @@ def scan(directory, force_hash=False, output_file=None):
     if output_file: output_result(summary, output_file)
     else: print(f"Scan complete. Reused: {len(unchanged)}, Added: {len(added)}, Changed: {len(changed)}, Deleted: {len(deleted)}, Renamed: {len(renames)}")
 
+def _valid_index(data):
+    if not isinstance(data, dict) or data.get('version') != SCHEMA_VERSION:
+        return False
+    if not isinstance(data.get('metadata'), dict) or not isinstance(data.get('files'), dict):
+        return False
+    for path, info in data['files'].items():
+        if not isinstance(path, str) or not isinstance(info, dict) or info.get('path') != path:
+            return False
+    return True
+
 def load_index(directory, silent=False):
     index_path = os.path.join(directory, INDEX_FILE)
     if not os.path.exists(index_path):
@@ -281,8 +286,11 @@ def load_index(directory, silent=False):
     try:
         with open(index_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            if data.get('version') != SCHEMA_VERSION:
+            if not isinstance(data, dict) or data.get('version') != SCHEMA_VERSION:
                 if not silent: eprint("Index version mismatch. Please run 'scan' again.")
+                return None
+            if not _valid_index(data):
+                if not silent: eprint("Malformed index. Please run 'scan' again.")
                 return None
             return data
     except Exception:
@@ -298,17 +306,29 @@ def build_forward_reverse(index):
     return forward, reverse
 
 def find_cycles(forward):
-    cycles, visited, path, path_set = [], set(), [], set()
-    def dfs(node):
-        if node in path_set:
-            cycles.append(path[path.index(node):] + [node])
-            return
-        if node in visited: return
-        visited.add(node); path.append(node); path_set.add(node)
-        for nxt in forward.get(node, []): dfs(nxt)
-        path.pop(); path_set.remove(node)
-    for node in forward:
-        if node not in visited: dfs(node)
+    cycles, visited = [], set()
+    for root in forward:
+        if root in visited:
+            continue
+        path, path_set = [root], {root}
+        visited.add(root)
+        stack = [(root, iter(forward.get(root, [])))]
+        while stack:
+            node, children = stack[-1]
+            try:
+                nxt = next(children)
+            except StopIteration:
+                stack.pop()
+                path_set.remove(node)
+                path.pop()
+                continue
+            if nxt in path_set:
+                cycles.append(path[path.index(nxt):] + [nxt])
+            elif nxt not in visited:
+                visited.add(nxt)
+                path.append(nxt)
+                path_set.add(nxt)
+                stack.append((nxt, iter(forward.get(nxt, []))))
     unique_cycles, seen = [], set()
     for c in cycles:
         canon = tuple(sorted(set(c)))
@@ -342,17 +362,33 @@ def generate_tree(files):
         curr["files"].append(parts[-1])
     
     lines = []
-    def walk(node, prefix=""):
-        for i, (d, sub) in enumerate(sorted(node["dirs"].items())):
-            is_last = (i == len(node["dirs"]) - 1 and len(node["files"]) == 0)
+    stack = [("enter", tree, "")]
+    while stack:
+        event, node_or_label, prefix = stack.pop()
+        if event == "dir_header":
+            lines.append(node_or_label)
+            continue
+        if event == "files":
+            node = node_or_label
+            for i, f in enumerate(sorted(node["files"])):
+                is_last = (i == len(node["files"]) - 1)
+                ptr = "└── " if is_last else "├── "
+                lines.append(f"{prefix}{ptr}{f}")
+            continue
+        # event == "enter"
+        node = node_or_label
+        dirs = sorted(node["dirs"].items())
+        # Files of this node come after all subdirectories; push last so they pop last.
+        stack.append(("files", node, prefix))
+        # Push dirs in reverse so the first dir pops (and renders) first.
+        for i in range(len(dirs) - 1, -1, -1):
+            d, sub = dirs[i]
+            is_last = (i == len(dirs) - 1 and len(node["files"]) == 0)
             ptr = "└── " if is_last else "├── "
-            lines.append(f"{prefix}{ptr}{d}/")
-            walk(sub, prefix + ("    " if is_last else "│   "))
-        for i, f in enumerate(sorted(node["files"])):
-            is_last = (i == len(node["files"]) - 1)
-            ptr = "└── " if is_last else "├── "
-            lines.append(f"{prefix}{ptr}{f}")
-    walk(tree)
+            child_prefix = prefix + ("    " if is_last else "│   ")
+            # Push subtree first (runs after header), then header (runs first).
+            stack.append(("enter", sub, child_prefix))
+            stack.append(("dir_header", f"{prefix}{ptr}{d}/", ""))
     return "\n".join(lines)
 
 def output_result(data, output_file):
