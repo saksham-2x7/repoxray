@@ -223,7 +223,7 @@ def scan(directory, output_file=None):
 
     all_files = set(index['files'].keys())
     for rel_path, info in index['files'].items():
-        if info.get('resolved_deps') and rel_path in unchanged: continue
+        
         resolved, heuristic, ambiguous, unresolved = [], [], [], []
         ambig_cand = {}
         for raw_dep in info.get('raw_dependencies', []):
@@ -320,7 +320,7 @@ def compute_metrics(index):
 def generate_tree(files):
     tree = {"dirs": defaultdict(dict), "files": []}
     for f in sorted(files):
-        parts = f.split('/')
+        parts = f.replace('\\', '/').split('/')
         curr = tree
         for part in parts[:-1]:
             if part not in curr["dirs"]: curr["dirs"][part] = {"dirs": defaultdict(dict), "files": []}
@@ -387,7 +387,7 @@ def overview(directory, output_file=None):
 
 def match_target(target, all_files):
     if target in all_files: return target
-    matches = [p for p in all_files if p.endswith(target) or target in p]
+    matches = [p for p in all_files if p == target or p.endswith('/' + target) or p.endswith('\\' + target)]
     if len(matches) == 1: return matches[0]
     if len(matches) > 1:
         eprint(f"Error: Target '{target}' is ambiguous. Matches: {', '.join(matches)}")
@@ -569,7 +569,10 @@ def inspect(filepath, output_file=None):
         result["first_bytes_ascii"] = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in header)
 
     if output_file: output_result(result, output_file)
-    else: print(json.dumps(result, indent=2))
+    else:
+        print(f"Inspection Report for {filepath}:")
+        for k, v in result.items():
+            if k != "metadata": print(f"{k.capitalize()}: {v}")
 
 def main():
     parser = argparse.ArgumentParser(description="RepoXray - Zero Dependency Codebase Analyzer")
