@@ -1,0 +1,1 @@
+I confirm that RepoXray has 0 runtime dependencies outside of the Python 3 standard library.
