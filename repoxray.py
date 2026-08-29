@@ -10,13 +10,14 @@ import struct
 import zipfile
 from collections import defaultdict, deque
 
-SCHEMA_VERSION = "2.1"
+SCHEMA_VERSION = "2.2"
 INDEX_FILE = '.repoxray.json'
+DEFAULT_IGNORE = {'.git', 'node_modules', '__pycache__', 'venv', 'env', 'dist', 'build', '.next'}
 
 IMPORT_PATTERNS = {
     'python': [
         re.compile(r'^\s*import\s+(.+)', re.MULTILINE),
-        re.compile(r'^\s*from\s+([\.a-zA-Z0-9_]+)\s+import\s+(.+)', re.MULTILINE)
+        re.compile(r'^\s*from\s+([\.a-zA-Z0-9_]+)\s+import\s+(?:\(([^)]+)\)|([^\n]+))', re.MULTILINE)
     ],
     'js': [
         re.compile(r'import\s+.*?from\s+[\'"]([^\'"]+)[\'"]', re.MULTILINE),
@@ -24,19 +25,11 @@ IMPORT_PATTERNS = {
     ]
 }
 
-DEFAULT_IGNORE = {'.git', 'node_modules', '__pycache__', 'venv', 'env', 'dist', 'build', '.next'}
-
-class Colors:
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-
 def disable_colors():
-    Colors.OKBLUE = Colors.OKCYAN = Colors.OKGREEN = Colors.WARNING = Colors.FAIL = Colors.ENDC = Colors.BOLD = ''
+    pass
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
 def get_file_hash(filepath):
     hasher = hashlib.sha256()
@@ -56,25 +49,31 @@ def is_text_file(filepath):
     except Exception:
         return False
 
+def clean_python_import(imp_str):
+    return re.sub(r'\s+as\s+\w+', '', imp_str).strip()
+
 def parse_text_file(filepath, file_type):
-    deps = set()
-    words = set()
+    deps, words, warnings = set(), set(), []
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             overlap = ""
             while True:
                 chunk = f.read(1024 * 1024)
-                if not chunk:
-                    break
+                if not chunk: break
                 text = overlap + chunk
+                
                 if file_type == 'python':
-                    for match in IMPORT_PATTERNS['python'][0].findall(text):
-                        for m in match.split(','): deps.add(m.strip())
-                    for mod, syms in IMPORT_PATTERNS['python'][1].findall(text):
+                    # Preprocess text to remove backslash newlines for regex to work easily
+                    clean_text = text.replace('\\\n', ' ')
+                    for match in IMPORT_PATTERNS['python'][0].findall(clean_text):
+                        for m in match.split(','): deps.add(clean_python_import(m))
+                    for match in IMPORT_PATTERNS['python'][1].findall(clean_text):
+                        mod = match[0]
+                        syms = match[1] if match[1] else match[2]
                         deps.add(mod)
                         for sym in syms.split(','):
-                            # Add mod.sym to cover submodules (e.g., from . import e -> .e)
-                            sym = sym.strip()
+                            sym = clean_python_import(sym)
+                            if not sym: continue
                             if mod.endswith('.'): deps.add(mod + sym)
                             else: deps.add(mod + '.' + sym)
                 else:
@@ -84,14 +83,9 @@ def parse_text_file(filepath, file_type):
                 for w in re.findall(r'[a-zA-Z0-9_]{3,}', text.lower()):
                     words.add(w)
                 overlap = text[-500:] if len(text) > 500 else text
-    except Exception:
-        pass
-    return list(deps), list(words)
-
-def get_file_type(ext):
-    if ext in ['.py']: return 'python'
-    if ext in ['.js', '.jsx', '.ts', '.tsx']: return 'js'
-    return 'unknown'
+    except Exception as e:
+        warnings.append(f"Partial scan or read error: {e}")
+    return list(deps), list(words), warnings
 
 def resolve_dependency(source_file, raw_dep, all_files):
     dir_name = os.path.dirname(source_file)
@@ -99,44 +93,42 @@ def resolve_dependency(source_file, raw_dep, all_files):
     exts_py = ['', '.py', '/__init__.py']
     is_js = source_file.endswith(('.js','.ts','.jsx','.tsx'))
     
-    # Python relative imports: from .module import X or from ..module import X
     if not is_js and raw_dep.startswith('.'):
         dots = len(raw_dep) - len(raw_dep.lstrip('.'))
         mod_path = raw_dep.lstrip('.').replace('.', '/')
         target_dir = dir_name
-        for _ in range(dots - 1):
-            target_dir = os.path.dirname(target_dir)
+        for _ in range(dots - 1): target_dir = os.path.dirname(target_dir)
         target = os.path.normpath(os.path.join(target_dir, mod_path)) if mod_path else target_dir
         for ext in exts_py:
-            if target + ext in all_files: return target + ext, "resolved_relative"
+            if target + ext in all_files: return target + ext, "resolved_relative", []
                 
-    # JS/TS relative imports
     elif raw_dep.startswith('.'):
         target = os.path.normpath(os.path.join(dir_name, raw_dep))
-        exts = exts_js if is_js else exts_py
-        for ext in exts:
-            if target + ext in all_files: return target + ext, "resolved_relative"
+        for ext in (exts_js if is_js else exts_py):
+            if target + ext in all_files: return target + ext, "resolved_relative", []
     else:
-        # Absolute or module import
         py_target = raw_dep.replace('.', '/')
         for ext in (exts_js if is_js else exts_py):
             local_target = os.path.normpath(os.path.join(dir_name, py_target)) + ext
-            if local_target in all_files: return local_target, "resolved_local"
-            if py_target + ext in all_files: return py_target + ext, "resolved_root"
+            if local_target in all_files: return local_target, "resolved_local", []
+            if py_target + ext in all_files: return py_target + ext, "resolved_root", []
             
-        # Fallback heuristic
+        candidates = []
         for f in all_files:
             bname = os.path.basename(f)
-            if bname == raw_dep + ".py" or bname == raw_dep + ".js" or bname == raw_dep + ".ts":
-                return f, "heuristic_basename"
+            if bname in [raw_dep + ".py", raw_dep + ".js", raw_dep + ".ts"]:
+                candidates.append(f)
+        
+        if len(candidates) == 1:
+            return candidates[0], "heuristic_basename", candidates
+        elif len(candidates) > 1:
+            return raw_dep, "ambiguous", candidates
                 
-    return None, "unresolved"
+    return raw_dep, "unresolved", []
 
 def scan(directory, output_file=None):
-    old_index = load_index(directory, silent=True)
-    if not old_index or old_index.get('version') != SCHEMA_VERSION:
-        old_index = {'files': {}}
-        
+    old_index = load_index(directory, silent=True) or {'files': {}}
+    
     index = {
         'version': SCHEMA_VERSION,
         'metadata': {'total_files': 0, 'total_dirs': 0, 'total_size': 0, 'warnings': []},
@@ -144,7 +136,8 @@ def scan(directory, output_file=None):
     }
     
     all_current_paths = set()
-    incremental_files = 0
+    added, changed, unchanged = [], [], []
+    skipped_count = 0
     
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in DEFAULT_IGNORE]
@@ -163,21 +156,25 @@ def scan(directory, output_file=None):
                 index['metadata']['total_size'] += size
                 index['metadata']['total_files'] += 1
                 
-                # Robust incremental check using hash
                 current_hash = get_file_hash(filepath)
                 old_record = old_index['files'].get(rel_path)
                 
                 if old_record and old_record.get('hash') == current_hash:
-                    old_record['mtime'] = mtime # Update mtime in case it changed but content is same
+                    old_record['mtime'] = mtime
                     index['files'][rel_path] = old_record
-                    incremental_files += 1
+                    unchanged.append(rel_path)
                     continue
                 
+                if old_record: changed.append(rel_path)
+                else: added.append(rel_path)
+                
                 _, ext = os.path.splitext(file)
-                f_type = get_file_type(ext)
+                f_type = 'python' if ext == '.py' else ('js' if ext in ['.js','.jsx','.ts','.tsx'] else 'unknown')
                 is_text = is_text_file(filepath)
                 
-                deps, words = parse_text_file(filepath, f_type) if is_text else ([], [])
+                deps, words, f_warns = parse_text_file(filepath, f_type) if is_text else ([], [], [])
+                if f_warns: skipped_count += 1
+                index['metadata']['warnings'].extend([f"{rel_path}: {w}" for w in f_warns])
                 
                 cat = 'source' if f_type != 'unknown' else 'other'
                 if 'test' in file.lower() or 'spec' in file.lower(): cat = 'test'
@@ -193,96 +190,98 @@ def scan(directory, output_file=None):
                     'raw_dependencies': deps,
                     'resolved_deps': [],
                     'heuristic_deps': [],
+                    'ambiguous_deps': [],
                     'unresolved_deps': [],
                     'words': words,
-                    'category': cat
+                    'category': cat,
+                    'ambiguous_candidates': {}
                 }
             except Exception as e:
                 index['metadata']['warnings'].append(f"Could not read {rel_path}: {str(e)}")
+                skipped_count += 1
 
-    # Resolve dependencies
+    old_paths = set(old_index['files'].keys())
+    deleted = list(old_paths - all_current_paths)
+
     all_files = set(index['files'].keys())
     for rel_path, info in index['files'].items():
-        resolved, heuristic, unresolved = [], [], []
+        if info.get('resolved_deps') and rel_path in unchanged: continue # Skip dep resolution for unchanged
+        
+        resolved, heuristic, ambiguous, unresolved = [], [], [], []
+        ambig_cand = {}
         for raw_dep in info.get('raw_dependencies', []):
-            res, method = resolve_dependency(rel_path, raw_dep, all_files)
+            res, method, cands = resolve_dependency(rel_path, raw_dep, all_files)
             if method.startswith("resolved"): resolved.append(res)
             elif method == "heuristic_basename": heuristic.append(res)
+            elif method == "ambiguous": 
+                ambiguous.append(res)
+                ambig_cand[res] = cands
             else: unresolved.append(raw_dep)
         
         info['resolved_deps'] = sorted(list(set(resolved)))
         info['heuristic_deps'] = sorted(list(set(heuristic)))
+        info['ambiguous_deps'] = sorted(list(set(ambiguous)))
         info['unresolved_deps'] = sorted(list(set(unresolved)))
+        info['ambiguous_candidates'] = ambig_cand
 
-    # Atomic Save
     index_path = os.path.join(directory, INDEX_FILE)
     tmp_path = index_path + ".tmp"
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(index, f)
+    with open(tmp_path, 'w', encoding='utf-8') as f: json.dump(index, f)
     os.replace(tmp_path, index_path)
 
-    if output_file:
-        output_result(index, output_file)
-    else:
-        print(f"{Colors.OKGREEN}Scan complete. Indexed {index['metadata']['total_files']} files. Incremental reuses: {incremental_files}.{Colors.ENDC}")
+    summary = {
+        "added": sorted(added),
+        "changed": sorted(changed),
+        "deleted": sorted(deleted),
+        "unchanged": sorted(unchanged),
+        "reused_count": len(unchanged),
+        "warnings": index['metadata']['warnings']
+    }
+
+    if output_file: output_result(summary, output_file)
+    else: print(f"Scan complete. Reused: {len(unchanged)}, Added: {len(added)}, Changed: {len(changed)}, Deleted: {len(deleted)}")
 
 def load_index(directory, silent=False):
     index_path = os.path.join(directory, INDEX_FILE)
     if not os.path.exists(index_path):
-        if not silent: print(f"{Colors.FAIL}Error: No index found. Run 'scan' first.{Colors.ENDC}", file=sys.stderr)
+        if not silent: eprint("Error: No index found. Run 'scan' first.")
         return None
     try:
         with open(index_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             if data.get('version') != SCHEMA_VERSION:
-                if not silent: print(f"{Colors.WARNING}Index version mismatch. Please run 'scan' again.{Colors.ENDC}", file=sys.stderr)
+                if not silent: eprint("Index version mismatch. Please run 'scan' again.")
                 return None
             return data
     except Exception:
-        if not silent: print(f"{Colors.FAIL}Error reading index.{Colors.ENDC}", file=sys.stderr)
+        if not silent: eprint("Error reading index.")
         return None
 
 def build_forward_reverse(index):
-    forward = defaultdict(list)
-    reverse = defaultdict(list)
+    forward, reverse = defaultdict(list), defaultdict(list)
     for p, info in index['files'].items():
-        # Build graph using both definitively resolved and heuristically resolved edges
         for dep in info.get('resolved_deps', []) + info.get('heuristic_deps', []):
             forward[p].append(dep)
             reverse[dep].append(p)
     return forward, reverse
 
 def find_cycles(forward):
-    cycles = []
-    visited = set()
-    path = []
-    path_set = set()
-
+    cycles, visited, path, path_set = [], set(), [], set()
     def dfs(node):
         if node in path_set:
-            idx = path.index(node)
-            cycles.append(path[idx:] + [node])
+            cycles.append(path[path.index(node):] + [node])
             return
-        if node in visited:
-            return
-            
-        visited.add(node)
-        path.append(node)
-        path_set.add(node)
+        if node in visited: return
+        visited.add(node); path.append(node); path_set.add(node)
         for nxt in forward.get(node, []): dfs(nxt)
-        path.pop()
-        path_set.remove(node)
-
+        path.pop(); path_set.remove(node)
     for node in forward:
         if node not in visited: dfs(node)
-            
-    unique_cycles = []
-    seen = set()
+    unique_cycles, seen = [], set()
     for c in cycles:
         canon = tuple(sorted(set(c)))
         if canon not in seen:
-            seen.add(canon)
-            unique_cycles.append(c)
+            seen.add(canon); unique_cycles.append(c)
     return unique_cycles
 
 def generate_tree(files):
@@ -291,8 +290,7 @@ def generate_tree(files):
         parts = f.split('/')
         curr = tree
         for part in parts[:-1]:
-            if part not in curr["dirs"]:
-                curr["dirs"][part] = {"dirs": defaultdict(dict), "files": []}
+            if part not in curr["dirs"]: curr["dirs"][part] = {"dirs": defaultdict(dict), "files": []}
             curr = curr["dirs"][part]
         curr["files"].append(parts[-1])
     
@@ -312,11 +310,9 @@ def generate_tree(files):
 
 def output_result(data, output_file):
     if output_file == '-':
-        disable_colors()
         print(json.dumps(data, indent=2))
     else:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+        with open(output_file, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2)
         print(f"Report saved to {output_file}")
 
 def overview(directory, output_file=None):
@@ -328,165 +324,127 @@ def overview(directory, output_file=None):
     cycles = find_cycles(forward)
     
     categories = defaultdict(int)
-    unresolved_count, rel_count, heuristic_count, unknown_binary_count = 0, 0, 0, 0
+    metrics = {"unresolved": 0, "proven": 0, "heuristic": 0, "ambiguous": 0, "unknown_bin": 0, "skipped": 0}
     
     for info in index['files'].values():
         categories[info['category']] += 1
-        unresolved_count += len(info.get('unresolved_deps', []))
-        rel_count += len(info.get('resolved_deps', []))
-        heuristic_count += len(info.get('heuristic_deps', []))
-        if not info.get('is_text') and info.get('extension') == '':
-            unknown_binary_count += 1
+        metrics['unresolved'] += len(info.get('unresolved_deps', []))
+        metrics['proven'] += len(info.get('resolved_deps', []))
+        metrics['heuristic'] += len(info.get('heuristic_deps', []))
+        metrics['ambiguous'] += len(info.get('ambiguous_deps', []))
+        if not info.get('is_text'): metrics['unknown_bin'] += 1
             
     tree_out = generate_tree(index['files'].keys())
 
     report = {
         "metadata": index["metadata"],
-        "categories": categories,
-        "relationship_count": rel_count,
-        "heuristic_relationship_count": heuristic_count,
-        "unresolved_relationships": unresolved_count,
+        "categories": dict(categories),
+        "total_files": index['metadata']['total_files'],
+        "total_dirs": index['metadata']['total_dirs'],
+        "total_size": index['metadata']['total_size'],
+        "relationship_count": metrics['proven'] + metrics['heuristic'],
+        "proven_relationship_count": metrics['proven'],
+        "heuristic_relationship_count": metrics['heuristic'],
+        "ambiguous_relationship_count": metrics['ambiguous'],
+        "unresolved_relationship_count": metrics['unresolved'],
         "orphans_count": len(orphans),
         "cycles_count": len(cycles),
-        "unknown_binary_count": unknown_binary_count,
-        "orphans": orphans[:50],
-        "project_tree": tree_out
+        "unknown_binary_count": metrics['unknown_bin'],
+        "skipped_or_partial_count": len(index['metadata']['warnings']),
+        "index_status": "ready",
+        "project_tree": tree_out,
+        "warnings": index['metadata']['warnings']
     }
 
     if output_file:
         output_result(report, output_file)
         return
 
-    print(f"\n{Colors.BOLD}Project Overview & Health Report:{Colors.ENDC}")
-    print(f"Total files: {index['metadata']['total_files']}")
-    print(f"Total size:  {index['metadata']['total_size'] / (1024*1024):.2f} MB")
-    
-    print(f"\n{Colors.BOLD}Categories:{Colors.ENDC}")
-    for cat, count in categories.items(): print(f"  {cat.capitalize():<10} {count}")
-        
-    print(f"\n{Colors.BOLD}Relationships:{Colors.ENDC}")
-    print(f"  Total Proven Edges: {rel_count}")
-    print(f"  Heuristic Edges   : {heuristic_count} (Fallback basename match)")
-    print(f"  Unresolved        : {unresolved_count}")
-    print(f"  Cycles            : {len(cycles)}")
-    
-    print(f"\n{Colors.BOLD}Project Map (First 40 paths):{Colors.ENDC}")
+    print("Project Overview & Health Report:\n")
+    for k, v in report.items():
+        if k not in ['project_tree', 'metadata', 'categories', 'warnings']: print(f"{k}: {v}")
+    print("\nProject Map (First 40 paths):")
     print("\n".join(tree_out.split("\n")[:40]))
-    
-    print(f"\n{Colors.WARNING}Potential Orphans (Heuristic: Source files with 0 incoming dependencies): {len(orphans)}{Colors.ENDC}")
-    for o in orphans[:10]: print(f"  - {o}")
-    if len(orphans) > 10: print("  ... and more")
 
 def match_target(target, all_files):
-    matches = [p for p in all_files if target in p]
-    if not matches: return None
-    return matches[0]
+    if target in all_files: return target
+    matches = [p for p in all_files if p.endswith(target) or target in p]
+    if len(matches) == 1: return matches[0]
+    if len(matches) > 1:
+        eprint(f"Error: Target '{target}' is ambiguous. Matches: {', '.join(matches)}")
+        sys.exit(1)
+    eprint(f"Error: Target '{target}' not found.")
+    sys.exit(1)
 
 def who_uses(filepath, directory, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
-    
     _, reverse = build_forward_reverse(index)
     target = match_target(filepath, index['files'].keys())
-    
-    if not target:
-        if output_file: output_result([], output_file)
-        else: print(f"{Colors.FAIL}File not found in index.{Colors.ENDC}")
-        return
-        
     users = sorted(reverse.get(target, []))
-    if output_file:
-        output_result(users, output_file)
-        return
-        
-    print(f"{Colors.OKBLUE}Files directly using '{target}':{Colors.ENDC}")
-    if not users: print("  (None)")
-    for u in users: print(f"  - {u}")
+    if output_file: output_result(users, output_file)
+    else:
+        print(f"Files directly using '{target}':")
+        for u in users: print(f"  - {u}")
 
 def depends_on(filepath, directory, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
-    
     target = match_target(filepath, index['files'].keys())
-    if not target:
-        if output_file: output_result({}, output_file)
-        else: print(f"{Colors.FAIL}File not found in index.{Colors.ENDC}")
-        return
-        
     info = index['files'][target]
-    resolved = info.get('resolved_deps', [])
-    heuristic = info.get('heuristic_deps', [])
-    unresolved = info.get('unresolved_deps', [])
-    
-    if output_file:
-        output_result({"resolved": resolved, "heuristic": heuristic, "unresolved": unresolved}, output_file)
-        return
-        
-    print(f"{Colors.OKBLUE}Dependencies for '{target}':{Colors.ENDC}")
-    print(f"{Colors.BOLD}Resolved:{Colors.ENDC}")
-    for d in resolved: print(f"  - {d}")
-    if heuristic:
-        print(f"\n{Colors.WARNING}Heuristic (Basename match):{Colors.ENDC}")
-        for d in heuristic: print(f"  - {d}")
-    print(f"\n{Colors.FAIL}Unresolved:{Colors.ENDC}")
-    for u in unresolved: print(f"  - {u}")
+    result = {
+        "resolved": info.get('resolved_deps', []),
+        "heuristic": info.get('heuristic_deps', []),
+        "ambiguous": info.get('ambiguous_deps', []),
+        "ambiguous_candidates": info.get('ambiguous_candidates', {}),
+        "unresolved": info.get('unresolved_deps', [])
+    }
+    if output_file: output_result(result, output_file)
+    else:
+        for k, v in result.items():
+            print(f"\n{k.capitalize()}:")
+            if isinstance(v, list):
+                for d in v: print(f"  - {d}")
+            elif isinstance(v, dict):
+                for d, cands in v.items(): print(f"  - {d} -> {cands}")
 
 def impact(filepath, directory, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
-    
     _, reverse = build_forward_reverse(index)
     target = match_target(filepath, index['files'].keys())
     
-    if not target:
-        if output_file: output_result({}, output_file)
-        else: print(f"{Colors.FAIL}File not found in index.{Colors.ENDC}")
-        return
-        
     direct = set(reverse.get(target, []))
-    visited = set(direct)
-    queue = deque(direct)
-    indirect = set()
-    
+    visited, queue, indirect = set(direct), deque(direct), set()
     while queue:
         curr = queue.popleft()
         for user in reverse.get(curr, []):
             if user not in visited and user != target:
-                visited.add(user)
-                indirect.add(user)
-                queue.append(user)
+                visited.add(user); indirect.add(user); queue.append(user)
                 
     result = {
         "changed": target,
         "direct": sorted(list(direct)),
         "indirect": sorted(list(indirect)),
         "potential_impact_count": len(direct) + len(indirect),
-        "warnings": "Dependency-based potential impact. Heuristic edges are included."
+        "warnings": ["Dependency-based potential impact. Heuristic edges are included."]
     }
-                
-    if output_file:
-        output_result(result, output_file)
-        return
-        
-    print(f"{Colors.WARNING}Graph-based impact analysis (Potential impact){Colors.ENDC}")
-    print(f"Changed: {target}\n")
-    print(f"{Colors.BOLD}Directly affected ({len(direct)}):{Colors.ENDC}")
-    for v in sorted(list(direct)): print(f"  - {v}")
-    
-    print(f"\n{Colors.BOLD}Indirectly affected ({len(indirect)}):{Colors.ENDC}")
-    for v in sorted(list(indirect)): print(f"  - {v}")
+    if output_file: output_result(result, output_file)
+    else:
+        print(f"Changed: {target}\nDirectly affected ({len(direct)}):")
+        for v in sorted(list(direct)): print(f"  - {v}")
+        print(f"\nIndirectly affected ({len(indirect)}):")
+        for v in sorted(list(indirect)): print(f"  - {v}")
 
 def search(query, directory, path_glob=None, output_file=None):
     index = load_index(directory)
+    if not index: sys.exit(1)
     matches_found = []
-    
+    # Case sensitive search in content, case insensitive prefilter
     query_words = set(re.findall(r'[a-zA-Z0-9_]{3,}', query.lower()))
-    
-    for filepath, info in (index['files'].items() if index else []):
+    for filepath, info in index['files'].items():
         if path_glob and not fnmatch.fnmatch(filepath, path_glob): continue
         if not info.get('is_text'): continue
-        
-        # Indexed prefilter
         if query_words and not query_words.issubset(set(info.get('words', []))): continue
             
         full_path = os.path.join(directory, filepath)
@@ -494,26 +452,20 @@ def search(query, directory, path_glob=None, output_file=None):
             with open(full_path, 'r', encoding='utf-8') as f:
                 for line_num, line in enumerate(f, 1):
                     if query in line:
-                        matches_found.append({
-                            'file': filepath,
-                            'line': line_num,
-                            'context': line.strip()[:100]
-                        })
-        except Exception:
-            pass
+                        matches_found.append({'file': filepath, 'line': line_num, 'context': line.strip()[:100]})
+        except Exception: pass
                 
     matches_found.sort(key=lambda x: (x['file'], x['line']))
-    
-    if output_file:
-        output_result(matches_found, output_file)
-        return
-        
-    print(f"{Colors.OKBLUE}Searching for '{query}' (Indexed)...{Colors.ENDC}\n")
-    for m in matches_found: print(f"{Colors.OKGREEN}{m['file']}:{m['line']}{Colors.ENDC} {m['context']}")
-    print(f"\n{Colors.BOLD}Total matches: {len(matches_found)}{Colors.ENDC}")
+    if output_file: output_result({"matches": matches_found, "count": len(matches_found)}, output_file)
+    else:
+        print(f"Searching for '{query}' (Indexed)...")
+        for m in matches_found: print(f"{m['file']}:{m['line']} {m['context']}")
+        print(f"Total matches: {len(matches_found)}")
 
 def inspect(filepath, output_file=None):
-    if not os.path.exists(filepath): sys.exit(1)
+    if not os.path.exists(filepath):
+        eprint("Error: File not found.")
+        sys.exit(1)
         
     size = os.path.getsize(filepath)
     ext = os.path.splitext(filepath)[1].lower()
@@ -521,12 +473,13 @@ def inspect(filepath, output_file=None):
     
     try:
         with open(filepath, 'rb') as f: header = f.read(32)
-    except Exception:
+    except Exception as e:
+        eprint(f"Error reading file: {e}")
         sys.exit(1)
 
-    file_type, confidence = "Unknown Binary", "Low"
-    metadata = {}
-    is_mismatch = False
+    file_type, confidence, evidence = "Unknown Binary", "Low", "first 32 bytes"
+    metadata, warnings = {}, []
+    is_mismatch, is_text = False, False
 
     if header.startswith(b'\x89PNG\r\n\x1a\n'): 
         file_type, confidence = "PNG Image", "High (Signature)"
@@ -540,20 +493,17 @@ def inspect(filepath, output_file=None):
     elif header.startswith(b'PK\x03\x04'): 
         file_type, confidence = "ZIP Archive", "High (Signature)"
         try:
-            with zipfile.ZipFile(filepath, 'r') as z:
-                metadata['zip_members'] = z.namelist()[:10]
-        except:
-            pass
+            with zipfile.ZipFile(filepath, 'r') as z: metadata['zip_members'] = z.namelist()[:10]
+        except Exception as e: warnings.append(f"Malformed ZIP: {str(e)}")
     elif header.startswith(b'SQLite format 3\x00'): 
         file_type, confidence = "SQLite Database", "High (Signature)"
         try:
             with open(filepath, 'rb') as f:
                 f.seek(16)
                 metadata['page_size'] = struct.unpack(">H", f.read(2))[0]
-        except:
-            pass
+        except Exception as e: warnings.append(f"Malformed SQLite: {str(e)}")
     elif is_text_file(filepath): 
-        file_type, confidence = "Text/Source", "Medium (Heuristic)"
+        file_type, confidence, is_text = "Text/Source", "Medium (Heuristic)", True
         if ext not in ['.txt', '.md', '.py', '.js', '.ts', '.html', '.css', '.json', '.yaml', '.yml', '.toml', '.ini', '.csv', '.xml', '']:
             is_mismatch = True
         if ext == '.json':
@@ -561,47 +511,34 @@ def inspect(filepath, output_file=None):
                 with open(filepath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     if isinstance(data, dict): metadata['json_keys'] = list(data.keys())[:10]
-            except:
-                pass
+            except Exception as e: warnings.append(f"Malformed JSON: {str(e)}")
 
     result = {
+        "path": filepath,
         "size": size,
         "extension": ext,
-        "type": file_type,
+        "sha256": file_hash,
+        "is_text": is_text,
+        "detected_type": file_type,
         "confidence": confidence,
-        "hash": file_hash,
+        "evidence": evidence,
         "extension_mismatch": is_mismatch,
-        "metadata": metadata
+        "metadata": metadata,
+        "warnings": warnings
     }
     if file_type == "Unknown Binary":
         result["first_bytes_hex"] = header.hex()
         result["first_bytes_ascii"] = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in header)
 
-    if output_file:
-        output_result(result, output_file)
-        return
-
-    print(f"{Colors.OKBLUE}Inspecting: {filepath}{Colors.ENDC}")
-    print(f"Size: {size} bytes")
-    print(f"Extension: {ext}")
-    print(f"Detected Type: {Colors.BOLD}{file_type}{Colors.ENDC} (Confidence: {confidence})")
-    if is_mismatch: print(f"{Colors.FAIL}Warning: Detected signature does not match extension '{ext}'{Colors.ENDC}")
-    print(f"SHA-256: {file_hash}")
-    
-    if metadata:
-        print(f"\n{Colors.BOLD}Extracted Metadata:{Colors.ENDC}")
-        for k, v in metadata.items(): print(f"  {k}: {v}")
-            
-    if file_type == "Unknown Binary":
-        print(f"\n{Colors.BOLD}Raw Header Preview:{Colors.ENDC}")
-        print(f"  Hex:   {header.hex()}")
+    if output_file: output_result(result, output_file)
+    else:
+        print(json.dumps(result, indent=2))
 
 def main():
     parser = argparse.ArgumentParser(description="RepoXray - Zero Dependency Codebase Analyzer")
     subparsers = parser.add_subparsers(dest="command")
     
-    def add_common(p):
-        p.add_argument("--output", help="Output JSON report file (or '-' for stdout)")
+    def add_common(p): p.add_argument("--output", help="Output JSON report file (or '-' for stdout)")
     
     p_scan = subparsers.add_parser("scan")
     p_scan.add_argument("path", nargs="?", default=".")
@@ -614,40 +551,35 @@ def main():
     p_search = subparsers.add_parser("search")
     p_search.add_argument("query")
     p_search.add_argument("path", nargs="?", default=".")
-    p_search.add_argument("--path", dest="path_glob", help="Glob pattern for paths (e.g. *.json)")
+    p_search.add_argument("--path", dest="path_glob", help="Glob pattern")
     add_common(p_search)
     
     p_inspect = subparsers.add_parser("inspect")
     p_inspect.add_argument("file")
     add_common(p_inspect)
     
-    p_impact = subparsers.add_parser("impact")
-    p_impact.add_argument("file")
-    p_impact.add_argument("path", nargs="?", default=".")
-    add_common(p_impact)
-    
-    p_who = subparsers.add_parser("who-uses")
-    p_who.add_argument("file")
-    p_who.add_argument("path", nargs="?", default=".")
-    add_common(p_who)
-    
-    p_depends = subparsers.add_parser("depends-on")
-    p_depends.add_argument("file")
-    p_depends.add_argument("path", nargs="?", default=".")
-    add_common(p_depends)
+    for cmd in ["impact", "who-uses", "depends-on"]:
+        p = subparsers.add_parser(cmd)
+        p.add_argument("file")
+        p.add_argument("path", nargs="?", default=".")
+        add_common(p)
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "scan": scan(args.path, args.output)
-    elif args.command == "overview": overview(args.path, args.output)
-    elif args.command == "search": search(args.query, args.path, getattr(args, 'path_glob', None), args.output)
-    elif args.command == "inspect": inspect(args.file, args.output)
-    elif args.command == "impact": impact(args.file, args.path, args.output)
-    elif args.command == "who-uses": who_uses(args.file, args.path, args.output)
-    elif args.command == "depends-on": depends_on(args.file, args.path, args.output)
+    try:
+        if args.command == "scan": scan(args.path or ".", args.output)
+        elif args.command == "overview": overview(args.path or ".", args.output)
+        elif args.command == "search": search(args.query, args.path or ".", getattr(args, 'path_glob', None), args.output)
+        elif args.command == "inspect": inspect(args.file, args.output)
+        elif args.command == "impact": impact(args.file, args.path or ".", args.output)
+        elif args.command == "who-uses": who_uses(args.file, args.path or ".", args.output)
+        elif args.command == "depends-on": depends_on(args.file, args.path or ".", args.output)
+    except Exception as e:
+        eprint(f"Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
