@@ -31,6 +31,7 @@ def get_file_hash(filepath):
         with open(filepath, 'rb') as f:
             for chunk in iter(lambda: f.read(65536), b''): hasher.update(chunk)
         return hasher.hexdigest()
+    except PermissionError: return None
     except Exception: return None
 
 def is_text_file(filepath):
@@ -38,6 +39,7 @@ def is_text_file(filepath):
         with open(filepath, 'tr', encoding='utf-8') as f:
             f.read(1024)
             return True
+    except PermissionError: return False
     except Exception: return False
 
 def parse_text_file(filepath, file_type):
@@ -47,14 +49,12 @@ def parse_text_file(filepath, file_type):
         with open(filepath, 'r', encoding='utf-8') as f:
             text = f.read()
             
-        # Line-location inverted index
         lines = text.split('\n')
         for line_num, line in enumerate(lines, 1):
             for w in re.findall(r'[a-zA-Z0-9_]{3,}', line.lower()):
                 if not words_index[w] or words_index[w][-1] != line_num:
                     words_index[w].append(line_num)
         
-        # AST parsing for Python
         if file_type == 'python':
             if "if __name__ == '__main__':" in text or 'if __name__ == "__main__":' in text:
                 is_entry_point = True
@@ -79,6 +79,8 @@ def parse_text_file(filepath, file_type):
             for pattern in IMPORT_PATTERNS.get(file_type, []):
                 for match in pattern.findall(text):
                     for m in match.split(','): deps.add(m.strip())
+    except PermissionError:
+        warnings.append(f"Permission denied: {filepath}")
     except Exception as e:
         warnings.append(f"Scan error: {e}")
     return list(deps), dict(words_index), is_entry_point, warnings
@@ -134,7 +136,10 @@ def scan(directory, output_file=None):
     added, changed, unchanged = [], [], []
     skipped_count = 0
     
-    for root, dirs, files in os.walk(directory):
+    def walk_err(err):
+        index['metadata']['warnings'].append(f"Directory access denied: {err}")
+        
+    for root, dirs, files in os.walk(directory, onerror=walk_err):
         dirs[:] = [d for d in dirs if d not in DEFAULT_IGNORE]
         index['metadata']['total_dirs'] += 1
         for file in files:
@@ -150,7 +155,6 @@ def scan(directory, output_file=None):
                 index['metadata']['total_files'] += 1
                 
                 old_record = old_index['files'].get(rel_path)
-                # Fast path O(changed-files) using mtime/size
                 if old_record and old_record.get('mtime') == mtime and old_record.get('size') == size:
                     index['files'][rel_path] = old_record
                     unchanged.append(rel_path)
@@ -195,6 +199,9 @@ def scan(directory, output_file=None):
                     'category': cat,
                     'ambiguous_candidates': {}
                 }
+            except PermissionError:
+                index['metadata']['warnings'].append(f"Permission denied: {rel_path}")
+                skipped_count += 1
             except Exception as e:
                 index['metadata']['warnings'].append(f"Could not read {rel_path}: {str(e)}")
                 skipped_count += 1
@@ -202,7 +209,6 @@ def scan(directory, output_file=None):
     old_paths = set(old_index['files'].keys())
     deleted = list(old_paths - all_current_paths)
     
-    # Rename detection
     deleted_hashes = {p: old_index['files'][p]['hash'] for p in deleted}
     added_hashes = {p: index['files'][p]['hash'] for p in added}
     renames = []
@@ -296,6 +302,21 @@ def find_cycles(forward):
             seen.add(canon); unique_cycles.append(c)
     return unique_cycles
 
+def compute_metrics(index):
+    forward, reverse = build_forward_reverse(index)
+    orphans = [p for p, info in index['files'].items() if p not in reverse and info['category'] == 'source' and not info.get('is_entry_point')]
+    cycles = find_cycles(forward)
+    categories = defaultdict(int)
+    metrics = {"unresolved": 0, "proven": 0, "heuristic": 0, "ambiguous": 0, "unknown_bin": 0, "skipped": 0}
+    for info in index['files'].values():
+        categories[info['category']] += 1
+        metrics['unresolved'] += len(info.get('unresolved_deps', []))
+        metrics['proven'] += len(info.get('resolved_deps', []))
+        metrics['heuristic'] += len(info.get('heuristic_deps', []))
+        metrics['ambiguous'] += len(info.get('ambiguous_deps', []))
+        if not info.get('is_text'): metrics['unknown_bin'] += 1
+    return forward, reverse, orphans, cycles, categories, metrics
+
 def generate_tree(files):
     tree = {"dirs": defaultdict(dict), "files": []}
     for f in sorted(files):
@@ -330,20 +351,7 @@ def overview(directory, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
         
-    forward, reverse = build_forward_reverse(index)
-    orphans = [p for p, info in index['files'].items() if p not in reverse and info['category'] == 'source' and not info.get('is_entry_point')]
-    cycles = find_cycles(forward)
-    
-    categories = defaultdict(int)
-    metrics = {"unresolved": 0, "proven": 0, "heuristic": 0, "ambiguous": 0, "unknown_bin": 0, "skipped": 0}
-    
-    for info in index['files'].values():
-        categories[info['category']] += 1
-        metrics['unresolved'] += len(info.get('unresolved_deps', []))
-        metrics['proven'] += len(info.get('resolved_deps', []))
-        metrics['heuristic'] += len(info.get('heuristic_deps', []))
-        metrics['ambiguous'] += len(info.get('ambiguous_deps', []))
-        if not info.get('is_text'): metrics['unknown_bin'] += 1
+    forward, reverse, orphans, cycles, categories, metrics = compute_metrics(index)
             
     tree_out = generate_tree(index['files'].keys())
 
@@ -390,7 +398,7 @@ def match_target(target, all_files):
 def who_uses(filepath, directory, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
-    _, reverse = build_forward_reverse(index)
+    _, reverse, _, _, _, _ = compute_metrics(index)
     target = match_target(filepath, index['files'].keys())
     users = sorted(reverse.get(target, []))
     if output_file: output_result(users, output_file)
@@ -422,7 +430,7 @@ def depends_on(filepath, directory, output_file=None):
 def impact(filepath, directory, output_file=None):
     index = load_index(directory)
     if not index: sys.exit(1)
-    _, reverse = build_forward_reverse(index)
+    _, reverse, _, _, _, _ = compute_metrics(index)
     target = match_target(filepath, index['files'].keys())
     
     direct = set(reverse.get(target, []))
@@ -462,12 +470,12 @@ def search(query, directory, path_glob=None, output_file=None):
         
         full_path = os.path.join(directory, filepath)
         try:
+            target_lines = set(words_index[q_lower])
             with open(full_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                for line_num in words_index[q_lower]:
-                    line_idx = line_num - 1
-                    if line_idx < len(lines) and query in lines[line_idx]:
-                        matches_found.append({'file': filepath, 'line': line_num, 'context': lines[line_idx].strip()[:100]})
+                for line_idx, line in enumerate(f):
+                    line_num = line_idx + 1
+                    if line_num in target_lines and query in line:
+                        matches_found.append({'file': filepath, 'line': line_num, 'context': line.strip()[:100]})
         except Exception: pass
                 
     matches_found.sort(key=lambda x: (x['file'], x['line']))
@@ -482,7 +490,12 @@ def inspect(filepath, output_file=None):
         eprint("Error: File not found.")
         sys.exit(1)
         
-    size = os.path.getsize(filepath)
+    try:
+        size = os.path.getsize(filepath)
+    except Exception as e:
+        eprint(f"Error accessing file size: {e}")
+        sys.exit(1)
+        
     ext = os.path.splitext(filepath)[1].lower()
     file_hash = get_file_hash(filepath)
     
@@ -521,7 +534,7 @@ def inspect(filepath, output_file=None):
             with open(filepath, 'rb') as f:
                 f.seek(16); metadata['page_size'] = struct.unpack(">H", f.read(2))[0]
                 f.seek(28); metadata['size_in_pages'] = struct.unpack(">I", f.read(4))[0]
-        except Exception as e:
+        except (struct.error, Exception) as e:
             confidence = "Low (Malformed)"
             warnings.append(f"Malformed SQLite: {str(e)}")
     elif is_text_file(filepath): 
