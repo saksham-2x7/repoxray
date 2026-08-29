@@ -32,3 +32,8 @@ RepoXray is a zero-dependency CLI tool that scans, searches, explores, and inspe
 
 ## Verification
 Run `python3 -S -c "import repoxray; print('stdlib check passed')"` to verify zero dependencies.
+
+## Contributors
+- [HamzaShaikh-source](https://github.com/HamzaShaikh-source)
+- [santoshsubramanian-web](https://github.com/santoshsubramanian-web?tab=repositories)
+- [Kaustubh-Negi-01](https://github.com/Kaustubh-Negi-01)
