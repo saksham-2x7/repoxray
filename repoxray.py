@@ -9,16 +9,19 @@ import fnmatch
 import struct
 import zipfile
 import ast
+import sqlite3
 from collections import defaultdict, deque
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "3.1"
 INDEX_FILE = '.repoxray.json'
 DEFAULT_IGNORE = {'.git', 'node_modules', '__pycache__', 'venv', 'env', 'dist', 'build', '.next'}
 
 IMPORT_PATTERNS = {
     'js': [
         re.compile(r'import\s+.*?from\s+[\'"]([^\'"]+)[\'"]', re.MULTILINE),
-        re.compile(r'require\([\'"]([^\'"]+)[\'"]\)', re.MULTILINE)
+        re.compile(r'require\([\'"]([^\'"]+)[\'"]\)', re.MULTILINE),
+        re.compile(r'import\s+[\'"]([^\'"]+)[\'"]', re.MULTILINE),
+        re.compile(r'export\s+.*?\s+from\s+[\'"]([^\'"]+)[\'"]', re.MULTILINE)
     ]
 }
 
@@ -37,7 +40,10 @@ def get_file_hash(filepath):
 def is_text_file(filepath):
     try:
         with open(filepath, 'tr', encoding='utf-8') as f:
-            f.read(1024)
+            chunk = f.read(1024)
+            if not chunk: return True
+            ctrl_chars = sum(1 for c in chunk if ord(c) < 32 and c not in '\n\r\t\f')
+            if ctrl_chars / len(chunk) > 0.05: return False
             return True
     except PermissionError: return False
     except Exception: return False
@@ -51,13 +57,11 @@ def parse_text_file(filepath, file_type):
             
         lines = text.split('\n')
         for line_num, line in enumerate(lines, 1):
-            for w in re.findall(r'[a-zA-Z0-9_]{3,}', line.lower()):
+            for w in re.findall(r'[a-zA-Z0-9_]+', line.lower()):
                 if not words_index[w] or words_index[w][-1] != line_num:
                     words_index[w].append(line_num)
         
         if file_type == 'python':
-            if "if __name__ == '__main__':" in text or 'if __name__ == "__main__":' in text:
-                is_entry_point = True
             try:
                 tree = ast.parse(text)
                 for node in ast.walk(tree):
@@ -71,6 +75,15 @@ def parse_text_file(filepath, file_type):
                         for n in node.names:
                             if full_mod.endswith('.'): deps.add(full_mod + n.name)
                             else: deps.add(full_mod + '.' + n.name)
+                    elif isinstance(node, ast.If):
+                        try:
+                            if isinstance(node.test, ast.Compare):
+                                left = node.test.left
+                                if isinstance(left, ast.Name) and left.id == '__name__':
+                                    right = node.test.comparators[0]
+                                    if isinstance(right, ast.Constant) and right.value == '__main__':
+                                        is_entry_point = True
+                        except Exception: pass
             except SyntaxError as e:
                 warnings.append(f"Python AST SyntaxError: {e}")
         else:
@@ -124,7 +137,7 @@ def resolve_dependency(source_file, raw_dep, all_files):
                 
     return raw_dep, "unresolved", []
 
-def scan(directory, output_file=None):
+def scan(directory, force_hash=False, output_file=None):
     old_index = load_index(directory, silent=True) or {'files': {}}
     index = {
         'version': SCHEMA_VERSION,
@@ -145,7 +158,7 @@ def scan(directory, output_file=None):
         for file in files:
             if file == INDEX_FILE: continue
             filepath = os.path.join(root, file)
-            rel_path = os.path.normpath(os.path.relpath(filepath, directory))
+            rel_path = os.path.normpath(os.path.relpath(filepath, directory)).replace('\\', '/')
             all_current_paths.add(rel_path)
             
             try:
@@ -155,13 +168,13 @@ def scan(directory, output_file=None):
                 index['metadata']['total_files'] += 1
                 
                 old_record = old_index['files'].get(rel_path)
-                if old_record and old_record.get('mtime') == mtime and old_record.get('size') == size:
+                if not force_hash and old_record and old_record.get('mtime') == mtime and old_record.get('size') == size:
                     index['files'][rel_path] = old_record
                     unchanged.append(rel_path)
                     continue
                 
                 current_hash = get_file_hash(filepath)
-                if old_record and old_record.get('hash') == current_hash:
+                if not force_hash and old_record and old_record.get('hash') == current_hash:
                     old_record['mtime'] = mtime
                     index['files'][rel_path] = old_record
                     unchanged.append(rel_path)
@@ -171,6 +184,7 @@ def scan(directory, output_file=None):
                 else: added.append(rel_path)
                 
                 _, ext = os.path.splitext(file)
+                ext = ext.lower()
                 f_type = 'python' if ext == '.py' else ('js' if ext in ['.js','.jsx','.ts','.tsx'] else 'unknown')
                 is_text = is_text_file(filepath)
                 
@@ -188,7 +202,7 @@ def scan(directory, output_file=None):
                     'size': size,
                     'hash': current_hash,
                     'is_text': is_text,
-                    'extension': ext.lower(),
+                    'extension': ext,
                     'raw_dependencies': deps,
                     'resolved_deps': [],
                     'heuristic_deps': [],
@@ -209,10 +223,11 @@ def scan(directory, output_file=None):
     old_paths = set(old_index['files'].keys())
     deleted = list(old_paths - all_current_paths)
     
-    deleted_hashes = {p: old_index['files'][p]['hash'] for p in deleted}
-    added_hashes = {p: index['files'][p]['hash'] for p in added}
+    deleted_hashes = {p: old_index['files'][p].get('hash') for p in deleted if old_index['files'].get(p)}
+    added_hashes = {p: index['files'][p].get('hash') for p in added}
     renames = []
     for a_path, a_hash in added_hashes.items():
+        if not a_hash: continue
         for d_path, d_hash in list(deleted_hashes.items()):
             if a_hash == d_hash:
                 renames.append({'from': d_path, 'to': a_path})
@@ -223,7 +238,6 @@ def scan(directory, output_file=None):
 
     all_files = set(index['files'].keys())
     for rel_path, info in index['files'].items():
-        
         resolved, heuristic, ambiguous, unresolved = [], [], [], []
         ambig_cand = {}
         for raw_dep in info.get('raw_dependencies', []):
@@ -401,7 +415,7 @@ def who_uses(filepath, directory, output_file=None):
     _, reverse, _, _, _, _ = compute_metrics(index)
     target = match_target(filepath, index['files'].keys())
     users = sorted(reverse.get(target, []))
-    if output_file: output_result(users, output_file)
+    if output_file: output_result({"file": target, "users": users}, output_file)
     else:
         print(f"Files directly using '{target}':")
         for u in users: print(f"  - {u}")
@@ -460,17 +474,25 @@ def search(query, directory, path_glob=None, output_file=None):
     if not index: sys.exit(1)
     matches_found = []
     q_lower = query.lower()
+    q_words = re.findall(r'[a-zA-Z0-9_]+', q_lower)
     
     for filepath, info in index['files'].items():
         if path_glob and not fnmatch.fnmatch(filepath, path_glob): continue
         if not info.get('is_text'): continue
         
         words_index = info.get('words_index', {})
-        if q_lower not in words_index: continue
+        target_lines = None
+        for w in q_words:
+            if w not in words_index:
+                target_lines = set()
+                break
+            if target_lines is None: target_lines = set(words_index[w])
+            else: target_lines = target_lines.intersection(set(words_index[w]))
+            
+        if target_lines is None or not target_lines: continue
         
         full_path = os.path.join(directory, filepath)
         try:
-            target_lines = set(words_index[q_lower])
             with open(full_path, 'r', encoding='utf-8') as f:
                 for line_idx, line in enumerate(f):
                     line_num = line_idx + 1
@@ -529,14 +551,15 @@ def inspect(filepath, output_file=None):
             confidence = "Low (Malformed)"
             warnings.append(f"Malformed ZIP: {str(e)}")
     elif header.startswith(b'SQLite format 3\x00'): 
-        file_type, confidence = "SQLite Database", "High (Validated)"
+        file_type, confidence = "SQLite Database", "High (Signature)"
         try:
-            with open(filepath, 'rb') as f:
-                f.seek(16); metadata['page_size'] = struct.unpack(">H", f.read(2))[0]
-                f.seek(28); metadata['size_in_pages'] = struct.unpack(">I", f.read(4))[0]
-        except (struct.error, Exception) as e:
+            with sqlite3.connect(f"file:{filepath}?mode=ro", uri=True) as conn:
+                conn.execute("pragma schema_version").fetchone()
+                confidence = "High (Validated)"
+        except sqlite3.DatabaseError as e:
             confidence = "Low (Malformed)"
-            warnings.append(f"Malformed SQLite: {str(e)}")
+            warnings.append(f"Malformed SQLite DB: {str(e)}")
+        except Exception: pass
     elif is_text_file(filepath): 
         file_type, confidence, is_text = "Text/Source", "Medium (Heuristic)", True
         if ext not in ['.txt', '.md', '.py', '.js', '.ts', '.html', '.css', '.json', '.yaml', '.yml', '.toml', '.ini', '.csv', '.xml', '']:
@@ -582,6 +605,7 @@ def main():
     
     p_scan = subparsers.add_parser("scan")
     p_scan.add_argument("path", nargs="?", default=".")
+    p_scan.add_argument("--force-hash", action="store_true", help="Skip mtime/size fast path")
     add_common(p_scan)
     
     p_overview = subparsers.add_parser("overview")
@@ -610,7 +634,7 @@ def main():
         sys.exit(1)
 
     try:
-        if args.command == "scan": scan(args.path or ".", args.output)
+        if args.command == "scan": scan(args.path or ".", args.force_hash, args.output)
         elif args.command == "overview": overview(args.path or ".", args.output)
         elif args.command == "search": search(args.query, args.path or ".", getattr(args, 'path_glob', None), args.output)
         elif args.command == "inspect": inspect(args.file, args.output)
