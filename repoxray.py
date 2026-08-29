@@ -235,7 +235,7 @@ def scan(directory, output_file=None):
         "deleted": sorted(deleted),
         "unchanged": sorted(unchanged),
         "reused_count": len(unchanged),
-        "warnings": index['metadata']['warnings'] + (["Some ambiguous edges were excluded from relationship counts and graph traversal."] if metrics["ambiguous"] > 0 else [])
+        "warnings": index['metadata']['warnings']
     }
 
     if output_file: output_result(summary, output_file)
