@@ -27,3 +27,16 @@ RepoXray is a zero-dependency CLI tool that scans, searches, explores, and inspe
 - **Large Files**: Files are streamed in chunks to extract dependencies and tokens safely, avoiding memory exhaustion.
 - **Renames**: Renamed files are treated as deletions + additions during incremental scans.
 
+
+
+## Output Schemas
+```json
+{
+  "metadata": { "total_files": 0, "total_dirs": 0, "total_size": 0, "warnings": [] },
+  "categories": { "source": 0 },
+  "project_tree": "├── ..."
+}
+```
+
+## Verification
+Run `python3 -S -c "import repoxray; print('stdlib check passed')"` to verify zero dependencies.

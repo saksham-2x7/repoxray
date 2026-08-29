@@ -235,7 +235,7 @@ def scan(directory, output_file=None):
         "deleted": sorted(deleted),
         "unchanged": sorted(unchanged),
         "reused_count": len(unchanged),
-        "warnings": index['metadata']['warnings']
+        "warnings": index['metadata']['warnings'] + (["Some ambiguous edges were excluded from relationship counts and graph traversal."] if metrics["ambiguous"] > 0 else [])
     }
 
     if output_file: output_result(summary, output_file)
@@ -353,7 +353,7 @@ def overview(directory, output_file=None):
         "skipped_or_partial_count": len(index['metadata']['warnings']),
         "index_status": "ready",
         "project_tree": tree_out,
-        "warnings": index['metadata']['warnings']
+        "warnings": index['metadata']['warnings'] + (["Some ambiguous edges were excluded from relationship counts and graph traversal."] if metrics["ambiguous"] > 0 else [])
     }
 
     if output_file:
@@ -427,7 +427,7 @@ def impact(filepath, directory, output_file=None):
         "direct": sorted(list(direct)),
         "indirect": sorted(list(indirect)),
         "potential_impact_count": len(direct) + len(indirect),
-        "warnings": ["Dependency-based potential impact. Heuristic edges are included."]
+        "warnings": ["Dependency-based potential impact. Heuristic edges included.", "Ambiguous edges were excluded from traversal."]
     }
     if output_file: output_result(result, output_file)
     else:
