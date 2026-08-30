@@ -1,0 +1,25 @@
+name: RepoXray CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Run test suite
+        run: python -m unittest discover -v
+
+      - name: Verify zero third-party runtime dependencies
+        run: python -S -c "import repoxray; print('stdlib import check passed')"
