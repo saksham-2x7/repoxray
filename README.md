@@ -54,7 +54,7 @@ python3 repoxray.py who-uses repoxray.py .
 python3 repoxray.py impact repoxray.py .
 ```
 
-Run `scan` again after adding, changing, or deleting files. Use `--force-hash` when you want content hashing to be forced.
+Run `scan` again after adding, changing, or deleting files. Metadata fast paths reuse unchanged records to avoid unnecessary work.
 
 ## 🔍 The seven commands
 
@@ -100,11 +100,11 @@ The claim is intentionally narrow: this is **zero third-party runtime dependenci
 
 RepoXray is intentionally a **single-file CLI** backed by a persistent JSON index.
 
-- Python imports use the standard-library `ast` module.
+- Python and JavaScript/TypeScript imports use regex-based extraction, so they are useful heuristics rather than complete language parsers.
 - JS/TS imports use regex-based extraction.
 - Dependency relationships are classified by confidence.
 - Reverse relationships enable `who-uses`, cycle analysis, and impact tracing.
-- Tree and dependency traversals use iterative algorithms so deep structures do not depend on Python's recursion limit.
+- Impact and user traversals use iterative algorithms with cycle-safe tracking. Tree rendering and cycle detection use recursive traversal.
 - Supported file inspection uses standard-library parsing and magic-byte checks.
 
 Read the deeper design notes:
